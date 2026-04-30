@@ -24,6 +24,9 @@
 <link rel="icon" type="image/png" sizes="512x512" href="icon-512.png">
 
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-messaging-compat.js"></script>
+<script src="firebase-config.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@400;700;900&family=JetBrains+Mono:wght@400;700&family=Bebas+Neue&display=swap');
 
@@ -353,6 +356,10 @@ body {
   50% { transform: scale(1.05); opacity: 1; }
   100% { transform: scale(1); }
 }
+@keyframes slideDown {
+  from { transform: translateY(-100%); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
 .dashboard.active { display: block; }
 
 .stock-header {
@@ -642,7 +649,7 @@ body {
 
     <h4 style="margin-top: 20px;">🔔 推播通知</h4>
     <p>當阿虎選股出現新股票時，主動推播通知到手機</p>
-    <button onclick="enablePushNotifications()" style="
+    <button id="enablePushBtn" onclick="enablePushNotifications()" style="
       background: var(--gold-soft); color: var(--gold);
       border: 1px solid var(--gold); padding: 10px 16px;
       font-family: 'Noto Serif TC', serif; font-weight: 700;
@@ -2107,32 +2114,195 @@ window.addEventListener('load', () => {
 });
 
 // ============================================================
-// PWA - 推播通知註冊（透過 Firebase Cloud Messaging）
+// PWA - 推播通知（Firebase Cloud Messaging 整合）
 // ============================================================
+let firebaseMessaging = null;
+
+function initFirebaseMessaging() {
+  if (firebaseMessaging) return firebaseMessaging;
+  if (typeof firebase === 'undefined') {
+    console.warn('[FCM] Firebase 尚未載入');
+    return null;
+  }
+  try {
+    firebase.initializeApp(FIREBASE_CONFIG);
+    firebaseMessaging = firebase.messaging();
+
+    // 前景訊息處理（App 開著時收到推播）
+    firebaseMessaging.onMessage((payload) => {
+      console.log('[FCM] 前景收到推播:', payload);
+      // 顯示自訂的 toast 通知
+      showInAppToast(
+        payload.notification?.title || '🐅 阿虎投信',
+        payload.notification?.body || '阿虎選股有新股票！'
+      );
+    });
+
+    return firebaseMessaging;
+  } catch (e) {
+    console.error('[FCM] 初始化失敗:', e);
+    return null;
+  }
+}
+
+function showInAppToast(title, body) {
+  const toast = document.createElement('div');
+  toast.style.cssText = `
+    position: fixed; top: calc(20px + env(safe-area-inset-top));
+    left: 16px; right: 16px; z-index: 9999;
+    background: var(--bg-card); border: 1px solid var(--gold);
+    border-left: 4px solid var(--gold);
+    padding: 14px 16px; border-radius: 4px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+    animation: slideDown 0.3s ease;
+  `;
+  toast.innerHTML = `
+    <div style="font-weight:900;color:var(--gold);font-size:14px;letter-spacing:1px;">${title}</div>
+    <div style="font-size:13px;color:var(--text-primary);margin-top:4px;line-height:1.5;">${body}</div>
+  `;
+  document.body.appendChild(toast);
+  toast.onclick = () => toast.remove();
+  setTimeout(() => {
+    toast.style.transition = 'opacity 0.3s, transform 0.3s';
+    toast.style.opacity = '0';
+    toast.style.transform = 'translateY(-20px)';
+    setTimeout(() => toast.remove(), 400);
+  }, 5000);
+}
+
 async function enablePushNotifications() {
   if (!('Notification' in window)) {
     alert('此瀏覽器不支援推播通知');
     return false;
   }
 
-  const permission = await Notification.requestPermission();
-  if (permission !== 'granted') {
-    alert('您拒絕了通知權限。可在瀏覽器設定中重新開啟。');
+  if (!('serviceWorker' in navigator)) {
+    alert('此瀏覽器不支援 Service Worker');
     return false;
   }
 
-  // 標記已啟用
-  localStorage.setItem('pushEnabled', '1');
+  // 申請權限
+  const permission = await Notification.requestPermission();
+  if (permission !== 'granted') {
+    alert('您拒絕了通知權限。可在「設定 → Safari → 通知」中重新開啟。');
+    return false;
+  }
 
-  // 觸發測試通知
-  new Notification('🐅 阿虎投信', {
-    body: '推播通知已啟用！阿虎選股有新股票時會通知你',
-    icon: 'icon-192.png',
-    badge: 'icon-192.png',
-  });
+  // 等 Service Worker 註冊完成
+  let registration;
+  try {
+    registration = await navigator.serviceWorker.ready;
+  } catch (e) {
+    alert('Service Worker 尚未就緒，請重新整理後再試');
+    return false;
+  }
 
-  return true;
+  // 初始化 Firebase
+  const messaging = initFirebaseMessaging();
+  if (!messaging) {
+    alert('Firebase Messaging 尚未就緒，請檢查網路或重新整理後再試');
+    return false;
+  }
+
+  try {
+    // 取得 FCM Token（這個 token 等於是這台手機的「住址」）
+    const token = await messaging.getToken({
+      vapidKey: VAPID_KEY,
+      serviceWorkerRegistration: registration,
+    });
+
+    if (!token) {
+      alert('無法取得推播權杖，可能是瀏覽器設定問題');
+      return false;
+    }
+
+    console.log('[FCM] 取得 token:', token);
+
+    // 把 token 上傳到後端訂閱
+    if (customBackend) {
+      try {
+        const subText = await xhrPost(customBackend + '/push/subscribe', {
+          token: token,
+          platform: 'web',
+          ua: navigator.userAgent,
+          subscribedAt: new Date().toISOString(),
+        }, 10000);
+        console.log('[FCM] 訂閱回應:', subText);
+      } catch (err) {
+        console.warn('[FCM] 上傳 token 失敗:', err);
+        alert('權限已啟用但通知上傳失敗。請確認 Cloudflare Worker 已升級到 v5');
+      }
+    } else {
+      alert('請先設定自訂後端網址，否則無法接收推播');
+      return false;
+    }
+
+    localStorage.setItem('pushEnabled', '1');
+    localStorage.setItem('pushToken', token);
+
+    // 顯示成功訊息
+    showInAppToast(
+      '🔔 推播已啟用',
+      '阿虎選股出現新股票時會通知你（每 30 分鐘掃描一次）'
+    );
+
+    // 更新按鈕狀態
+    const btn = document.getElementById('enablePushBtn');
+    if (btn) {
+      btn.innerHTML = '✅ 推播已啟用';
+      btn.disabled = true;
+      btn.style.opacity = '0.6';
+    }
+
+    return true;
+  } catch (e) {
+    console.error('[FCM] 啟用失敗:', e);
+    alert('啟用推播失敗：' + e.message);
+    return false;
+  }
 }
+
+// XHR POST helper（用於上傳 token 到後端）
+function xhrPost(url, data, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return; done = true;
+      try { xhr.abort(); } catch(e) {}
+      reject(new Error('timeout'));
+    }, timeoutMs || 10000);
+    xhr.open('POST', url, true);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.onload = function() {
+      if (done) return; done = true; clearTimeout(timer);
+      if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.responseText);
+      else reject(new Error('HTTP ' + xhr.status));
+    };
+    xhr.onerror = function() {
+      if (done) return; done = true; clearTimeout(timer);
+      reject(new Error('network'));
+    };
+    try { xhr.send(JSON.stringify(data)); } catch(e) { clearTimeout(timer); reject(e); }
+  });
+}
+
+// 頁面載入時，如果用戶之前已啟用推播，自動初始化 Firebase（用於前景訊息）
+window.addEventListener('load', () => {
+  if (localStorage.getItem('pushEnabled') === '1' && Notification.permission === 'granted') {
+    setTimeout(initFirebaseMessaging, 1500);
+
+    // 把按鈕標示為已啟用
+    setTimeout(() => {
+      const btn = document.getElementById('enablePushBtn');
+      if (btn) {
+        btn.innerHTML = '✅ 推播已啟用';
+        btn.disabled = true;
+        btn.style.opacity = '0.6';
+      }
+    }, 100);
+  }
+});
 
 
 
